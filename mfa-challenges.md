@@ -1,0 +1,41 @@
+# SMS/Voice → Passkey/Authenticator MFA Migration: Challenges
+
+Context: Microsoft is retiring native SMS/Voice in Entra ID. Passkeys become the default experience Sept 1, 2026 (auto-enrollment + registration campaign nudges for anyone still on SMS/Voice, in either the Authentication Methods Policy or legacy per-user MFA settings). Microsoft-provided SMS/Voice delivery fully retires Feb 1, 2027 — after that, users whose only method is SMS/Voice get a **blocking** passkey registration prompt, no opt-out. Continued SMS/Voice after that date requires contracting a customer-managed telecom provider via the Microsoft Security Store (available for selection starting Oct 30, 2026; provider details published Sept 18, 2026). This is the forcing function behind the timeline below.
+
+## 1. Legacy MFA vs. Authentication Methods Policy (AMP) gap
+
+- Legacy per-user MFA settings (**Entra ID > Users > Per-user MFA > service settings**) and legacy SSPR settings (**Entra ID > Users > Password reset > Authentication methods**) are separate from AMP (**Entra ID > Authentication methods > Policies**). A method can be "on" in one and "off"/unconfigured in the other — users enabled for SMS in the legacy MFA blade but not reflected in AMP are still in scope for the Sept 1, 2026 auto-enrollment, so an AMP-only audit will undercount.
+- No single report shows the combined picture. Identifying every user still on SMS/Voice requires either the Microsoft-provided PowerShell script (`entra-sms-voice-usage-analyzer`) or a Graph query spanning both legacy settings and AMP — same pattern used for the KB4 `signInActivity` pull, reusable here.
+- Microsoft's migration wizard (AMP > Manage migration) audits legacy MFA/SSPR and proposes AMP settings, but it only migrates **tenant-level policy toggles**, not individual per-user/per-group registrations. Anyone with a personal exception in the legacy policy won't carry over automatically.
+- Security questions have no AMP equivalent yet — they stay governed by the legacy SSPR policy even after migration is otherwise marked complete. If security questions are still in use, that's an explicit exception to carry forward or retire on its own track.
+- Setting migration status to "Migration Complete" grays out the legacy blades entirely (except security questions) — this is a one-way-feeling step operationally even though Microsoft says it's reversible; worth a rollback runbook before flipping it tenant-wide.
+- Interaction with the existing tiered rollout (FIDO2 for IT/app owners, SMS-minimum for execs): the exec "SMS-minimum" tier is the one most exposed by the retirement timeline and will need a decision — passkey, or a paid telecom provider contract — before Feb 2027.
+
+## 2. SSPR changes
+
+- SSPR is converging into AMP, but not the whole way: password reset via SMS/Voice is affected by the same retirement timeline, while security questions remain a legacy-only control.
+- Reporting suggests Entra is moving to require SSPR methods be **explicitly registered** rather than inferred from profile attributes (mobile/office phone, alternate email stored on the user object but never registered as an auth method) — worth validating current registration coverage now rather than assuming profile data will keep working.
+- Legacy SSPR scoping (all users / one group / no users) is coarser than AMP's per-method, per-group targeting. Reconciling "who can use what for password reset" needs a mapping exercise, not a straight copy.
+- No clean self-service password reset story yet for fully passwordless/passkey-only users — Microsoft has flagged this as a future capability ("planning to introduce support to change password for users who authenticate with passwordless sign-in") but it isn't shipped. Passkey-only users still have a password underneath; how they change/reset it isn't fully solved today.
+
+## 3. Support/helpdesk process changes: revoking passkeys vs. SMS
+
+- SMS revocation today is low-friction: disable/replace a phone number, done. Passkey revocation is per-credential: helpdesk goes into the user's **Authentication methods** blade and deletes each registered passkey individually (device-bound Authenticator passkey, platform-synced passkey, hardware FIDO2 key) — no single "reset MFA" bulk action equivalent.
+- Users can hold multiple passkeys across devices; helpdesk needs a way to tell which one is compromised/lost vs. which are still valid before deleting, which the current admin UI doesn't make obvious at a glance.
+- Synced passkeys (iCloud Keychain, Google Password Manager) aren't fully revoked by deleting the Entra-side registration — if the underlying Apple/Google account is compromised, the credential may still be usable elsewhere until the platform account itself is secured. Revocation SOP needs to say this explicitly.
+- Lost-device recovery is heavier than lost-SIM recovery: with SMS, proving phone number control was the whole bar. With passkey-only users, losing the only phishing-resistant method means helpdesk needs a stronger identity-proofing step (manager attestation, TAP, video verification) before issuing a new registration path — and that step itself becomes a target for helpdesk-impersonation social engineering, so it needs to be designed deliberately, not improvised per ticket.
+- RBAC: deleting a user's authentication methods requires Authentication Policy Administrator (or a scoped role like Security Operator, which can remove non-admin users' auth methods without full admin rights). Confirm helpdesk's current role assignments cover this — "reset MFA" under the old model may have been available at a lower tier than what's needed to manage FIDO2/passkey credentials.
+- Existing helpdesk runbooks/scripts written around "verify phone number, reset MFA" need to be rewritten end to end for passkey-specific identification, revocation, and re-enrollment steps.
+- Confirm the Authentication methods activity report captures passkey registration/deletion events with enough detail for incident response and audit — this becomes the primary trail once SMS logs go away.
+
+## 4. Other challenges
+
+- **AAGUID allow-listing**: already flagged internally — AMP can restrict passkeys to an allow-listed AAGUID set. Authenticator passkey registration can silently fail if its AAGUID isn't on the list even though passkeys show as "enabled." This needs revisiting any time Microsoft/OS vendors change AAGUIDs.
+- **Device/workforce fit**: platform passkeys assume a personal, owned device. Shared-device or frontline/field workforce scenarios don't fit that model and likely need hardware FIDO2 keys instead — a procurement and logistics cost, not just a policy change.
+- **Legacy/line-of-business apps**: anything still on basic auth or older protocols that only understands username/password + SMS OTP won't support passkey flows, forcing a longer-lived exception group.
+- **Break-glass/emergency access accounts**: these can't depend on Microsoft-provided SMS given the retirement, and if Conditional Access starts requiring phishing-resistant strength broadly, break-glass accounts need explicit, audited exclusions.
+- **Registration campaign fatigue**: default "unlimited snoozes" on the Sept 1, 2026 nudge means adoption can stall without either tuning the snooze limit or backing it with a Conditional Access authentication strength requirement for target groups.
+- **Cost**: native SMS is currently free; continuing SMS past Feb 2027 requires a paid third-party telecom contract through the Security Store, priced per message — budget and procurement lead time to sort out if any user segment needs to stay on SMS.
+- **B2B/guest users**: passkey support for B2B/guest accounts isn't expected until end of calendar year 2026, leaving a temporary gap for any external users currently on SMS.
+- **User confusion**: many users already use Authenticator push approval for MFA and will conflate that with "having a passkey." Registering an actual passkey is a separate enrollment step — communications need to draw that distinction explicitly or registration numbers will look inflated relative to real coverage.
+- **Executive/VIP buy-in**: the SMS-minimum tier for execs is the most exposed group in this timeline and is as much a political conversation as a technical one.

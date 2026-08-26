@@ -1,0 +1,19 @@
+# Generated reports — a phone-only CSV is a prioritised phishing target list.
+# Never commit one. If one ever lands in history, treat it as an incident.
+output/
+*.csv
+
+# Secrets — never commit
+.env
+credentials.json
+token.json
+*.pfx
+*.cer
+*.pem
+
+# Personal Claude Code overrides
+.claude/settings.local.json
+
+# Intermediates — always regenerable
+.tmp/*
+!.tmp/.gitkeep
