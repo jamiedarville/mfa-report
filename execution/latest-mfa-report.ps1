@@ -44,6 +44,11 @@ param(
     # Add the raw Graph values as extra columns, for troubleshooting.
     [switch] $IncludeTechnicalColumns,
 
+    # Include EVERY user, not just phone-method holders, so the CSV can be filtered
+    # in Excel. Filter on the "Uses SMS or Voice" column. Note this produces a
+    # full-tenant MFA posture dump - see the sensitivity note in CLAUDE.md.
+    [switch] $AllUsers,
+
     # Default to the repo's gitignored output/ directory. Do NOT default this to a
     # user profile path - $env:USERPROFILE is Windows-only and resolves to $null on
     # Linux/macOS, which silently drops the CSV into the current working directory.
@@ -241,36 +246,54 @@ if ($missingScopes.Count -gt 0) {
 }
 
 # ---------------------------------------------------------------------------
-# STAGE 1 - registration details, filtered server-side to phone holders
+# STAGE 1 - registration details
 # ---------------------------------------------------------------------------
 # v1.0, not beta: this resource is GA. methodsRegistered supports $filter with
-# any/eq, so the tenant-wide scan happens on Microsoft's side, not here.
-Write-Host "`n[1/3] Finding users with a phone method registered..." -ForegroundColor Cyan
-
+# any/eq, so by default the tenant-wide scan happens on Microsoft's side, not
+# here. -AllUsers drops the filter to produce a full-directory CSV instead.
 $phoneFilter = ($PhoneMethodFriendly.Keys | ForEach-Object {
     "methodsRegistered/any(m:m eq '$_')"
 }) -join ' or '
 
 $regBase = "https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails"
 
-try {
-    $regData = Get-GraphPaged -Uri "$regBase`?`$filter=$([uri]::EscapeDataString($phoneFilter))" `
-                              -Activity 'Registration details (filtered)'
+if ($AllUsers) {
+    Write-Host "`n[1/3] Pulling registration details for ALL users..." -ForegroundColor Cyan
+    $regData = Get-GraphPaged -Uri $regBase -Activity 'Registration details (all users)'
 }
-catch {
-    # Only a 400 means the filter itself was rejected. Anything else - throttle
-    # exhaustion, missing consent, licensing - must surface as itself: falling
-    # back would re-pull the whole tenant against a service that is already
-    # failing, and mislabel the real cause.
-    $status = Get-GraphStatusCode -ErrorRecord $_
-    if ($status -ne 400) { throw }
-    Write-Warning "Server-side filter rejected (HTTP 400). Falling back to a full scan - slower, same result."
-    $regData = Get-GraphPaged -Uri $regBase -Activity 'Registration details (full scan)' |
-               Where-Object { @($_.methodsRegistered | Where-Object { $PhoneMethodFriendly.ContainsKey($_) }).Count -gt 0 }
+else {
+    Write-Host "`n[1/3] Finding users with a phone method registered..." -ForegroundColor Cyan
+    try {
+        $regData = Get-GraphPaged -Uri "$regBase`?`$filter=$([uri]::EscapeDataString($phoneFilter))" `
+                                  -Activity 'Registration details (filtered)'
+    }
+    catch {
+        # Only a 400 means the filter itself was rejected. Anything else - throttle
+        # exhaustion, missing consent, licensing - must surface as itself: falling
+        # back would re-pull the whole tenant against a service that is already
+        # failing, and mislabel the real cause.
+        $status = Get-GraphStatusCode -ErrorRecord $_
+        if ($status -ne 400) { throw }
+        Write-Warning "Server-side filter rejected (HTTP 400). Falling back to a full scan - slower, same result."
+        $regData = Get-GraphPaged -Uri $regBase -Activity 'Registration details (full scan)' |
+                   Where-Object { @($_.methodsRegistered | Where-Object { $PhoneMethodFriendly.ContainsKey($_) }).Count -gt 0 }
+    }
 }
 
 $regData = @($regData)
-Write-Host "      $($regData.Count) users have a phone number registered." -ForegroundColor Yellow
+
+# The SMS/voice cohort, whether or not the CSV will contain everyone else too.
+# This is the ONLY set stage 3 may touch: -AllUsers must not turn the per-user
+# stage into a 22,000-request loop.
+$phoneHolders = @($regData | Where-Object {
+    @($_.methodsRegistered | Where-Object { $PhoneMethodFriendly.ContainsKey($_) }).Count -gt 0
+})
+
+if ($AllUsers) {
+    Write-Host "      $($regData.Count) users in the report; $($phoneHolders.Count) have a phone method." -ForegroundColor Yellow
+} else {
+    Write-Host "      $($regData.Count) users have a phone number registered." -ForegroundColor Yellow
+}
 
 if ($regData.Count -eq 0) {
     # A consent problem plus an empty result is a FAILED run, not an empty tenant -
@@ -313,11 +336,16 @@ if ($SkipLegacyStateLookup) {
     Write-Host "[3/3] Legacy per-user MFA state lookup SKIPPED by parameter." -ForegroundColor DarkYellow
     Write-Warning "The 'MFA Type' column will read 'Unknown' for every row."
 }
+elseif ($phoneHolders.Count -eq 0) {
+    Write-Host "[3/3] No phone-method users - skipping legacy state lookup." -ForegroundColor DarkGray
+}
 else {
     Write-Host "[3/3] Checking which users are on legacy per-user MFA (batched)..." -ForegroundColor Cyan
 
-    $ids       = @($regData | ForEach-Object { $_.id })   # force an array: .Prop on a
-    $batchSize = 20                                        # 1-element list returns a scalar
+    # $phoneHolders, NOT $regData: legacy governance only matters for the SMS/voice
+    # cohort, and this is the stage whose cost scales per user.
+    $ids       = @($phoneHolders | ForEach-Object { $_.id })  # force an array: .Prop
+    $batchSize = 20                                           # on a 1-item list is scalar
 
     # Graph throttles $batch items INDIVIDUALLY: the envelope returns HTTP 200
     # while a sub-response carries its own 429 + Retry-After, so the envelope-level
@@ -439,7 +467,13 @@ $Report = foreach ($r in $regData) {
                      } elseif ($preferredRaw) { $preferredRaw } else { 'Not set' }
     $defaultIsPhone = $preferredRaw -in $PhonePreferred
 
-    $state = if ($SkipLegacyStateLookup)              { "NotChecked" }
+    # Does this user have any phone method at all? Under -AllUsers most rows will
+    # not, and every retirement-related column below has to say so rather than
+    # implying the SMS/voice deadline applies to them.
+    $hasPhone = $split.Phone.Count -gt 0
+
+    $state = if (-not $hasPhone)                      { "NoPhoneMethod" }
+             elseif ($SkipLegacyStateLookup)          { "NotChecked" }
              elseif ($legacyState.ContainsKey($r.id)) { $legacyState[$r.id] }
              else                                     { "NotRetrieved" }
 
@@ -450,12 +484,13 @@ $Report = foreach ($r in $regData) {
     # per-user MFA surface; "Modern" means it is governed by the Authentication
     # Methods Policy / Conditional Access instead.
     $mfaType = switch ($state) {
-        'enabled'      { 'Legacy' }
-        'enforced'     { 'Legacy' }
-        'disabled'     { 'Modern' }
-        'NotChecked'   { 'Unknown - not checked' }
-        'AccessDenied' { 'Unknown - permission denied' }
-        default        { 'Unknown - lookup failed' }
+        'enabled'       { 'Legacy' }
+        'enforced'      { 'Legacy' }
+        'disabled'      { 'Modern' }
+        'NoPhoneMethod' { 'Not checked - no phone method' }
+        'NotChecked'    { 'Unknown - not checked' }
+        'AccessDenied'  { 'Unknown - permission denied' }
+        default         { 'Unknown - lookup failed' }
     }
 
     # Backup classification, honestly. A Temporary Access Pass expires within hours
@@ -466,12 +501,15 @@ $Report = foreach ($r in $regData) {
     $unverifiedOnly   = (-not $hasDurableBackup) -and ($split.Unclassified.Count -gt 0)
     $tempOnly         = (-not $hasDurableBackup) -and (-not $unverifiedOnly) -and ($split.Temporary.Count -gt 0)
     $blockedOutright  = (-not $hasDurableBackup) -and (-not $unverifiedOnly)   # includes tempOnly
-    $atRisk           = -not $hasDurableBackup
+    # Only phone holders are at risk from the SMS/voice retirement. A user with no
+    # phone and no MFA at all is a real gap, but not THIS deadline's gap.
+    $atRisk           = $hasPhone -and (-not $hasDurableBackup)
 
     $backupAnswer =
         if     ($hasDurableBackup) { 'Yes' }
         elseif ($unverifiedOnly)   { 'Unknown - method not recognised' }
         elseif ($tempOnly)         { 'Temporary pass only' }
+        elseif (-not $hasPhone)    { 'No - no MFA method at all' }
         else                       { 'No' }
 
     # Never pair a non-"No" answer with a blank list - every registered non-phone
@@ -484,8 +522,9 @@ $Report = foreach ($r in $regData) {
 
     # Only a mobile number can receive an SMS. Office and alternate-mobile numbers
     # are voice-call only, so a user holding just those is not an "SMS user" at all.
-    $phoneCapability = if ($split.Phone -contains 'mobilePhone') { 'Text message or phone call' }
-                       else                                      { 'Phone call only' }
+    $phoneCapability = if     (-not $hasPhone)                       { 'No phone registered' }
+                       elseif ($split.Phone -contains 'mobilePhone') { 'Text message or phone call' }
+                       else                                          { 'Phone call only' }
 
     if ($split.Unclassified.Count -gt 0) {
         $script:UnclassifiedUsers += "$($r.userPrincipalName): $($split.Unclassified -join ', ')"
@@ -495,14 +534,18 @@ $Report = foreach ($r in $regData) {
     # Modern user who signs in with SMS every day outranks a Legacy user already
     # on the Authenticator app.
     $priority =
-        if     ($atRisk -and $r.isAdmin) { '1 - Urgent' }
+        if     (-not $hasPhone)          { '6 - Not affected' }
+        elseif ($atRisk -and $r.isAdmin) { '1 - Urgent' }
         elseif ($atRisk)                 { '2 - High' }
         elseif ($defaultIsPhone)         { '3 - Medium' }
         elseif ($legacyEnabled)          { '4 - Low' }
         else                             { '5 - Monitor' }
 
     $action =
-        if     ($unverifiedOnly)                  { 'Check with IT: a registered method could not be classified by this report. Treat as having no backup until verified.' }
+        if     (-not $hasPhone -and -not $hasDurableBackup -and -not $tempOnly -and -not $unverifiedOnly) {
+                                                    'Not affected by the SMS/voice retirement, but has no MFA method registered at all. Worth a separate look.' }
+        elseif (-not $hasPhone)                   { 'None - not affected by the SMS/voice retirement.' }
+        elseif ($unverifiedOnly)                  { 'Check with IT: a registered method could not be classified by this report. Treat as having no backup until verified.' }
         elseif ($tempOnly)                        { 'Their only backup is a Temporary Access Pass, which expires. Set up Microsoft Authenticator or a passkey now.' }
         elseif ($blockedOutright -and $r.isAdmin) { 'Urgent: administrator with no backup method. Set up a passkey or security key now.' }
         elseif ($blockedOutright)                 { 'Set up Microsoft Authenticator or a passkey before 1 Feb 2027.' }
@@ -512,12 +555,16 @@ $Report = foreach ($r in $regData) {
         else                                      { 'Has a non-phone backup, but legacy MFA status was not checked. Re-run the full report before closing this row out.' }
 
     $outcome =
-        if     ($hasDurableBackup) { 'Can still sign in using their other method' }
+        if     (-not $hasPhone)    { 'Not affected - no phone method registered' }
+        elseif ($hasDurableBackup) { 'Can still sign in using their other method' }
         elseif ($unverifiedOnly)   { 'Unknown - depends on a method this report could not classify' }
         elseif ($tempOnly)         { 'BLOCKED once the temporary pass expires - forced to set up a passkey' }
         else                       { 'BLOCKED - forced to set up a passkey before they can sign in' }
 
     $row = [ordered]@{
+        # The filter column. In Excel: Data > Filter, then tick "Yes" here to get
+        # exactly the default (non--AllUsers) report back.
+        'Uses SMS or Voice'       = if ($hasPhone) { 'Yes' } else { 'No' }
         'Priority'                = $priority
         'Name'                    = $r.userDisplayName
         'Sign-in Name'            = $r.userPrincipalName
@@ -557,15 +604,24 @@ $Report = $Report | Sort-Object Priority, 'Name'
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-$noBackup   = @($Report | Where-Object { $_.'Has Non-Phone Backup' -in @('No','Temporary pass only') })
+# Every count below is scoped to the SMS/voice cohort, never to the whole CSV -
+# under -AllUsers those are different numbers and conflating them would overstate
+# or understate the exposure depending on which way you squint.
+$inScope    = @($Report | Where-Object { $_.'Uses SMS or Voice' -eq 'Yes' })
+$noBackup   = @($inScope | Where-Object { $_.'Has Non-Phone Backup' -in @('No','Temporary pass only') })
 $admins     = @($noBackup | Where-Object { $_.Administrator -eq 'Yes' })
-$legacy     = @($Report | Where-Object { $_.'MFA Type' -eq 'Legacy' })
-$unknownGov = @($Report | Where-Object { $_.'MFA Type' -like 'Unknown*' })
-$unverified = @($Report | Where-Object { $_.'Has Non-Phone Backup' -like 'Unknown*' })
-$onPhone    = @($Report | Where-Object { $_.'Currently Signs In With' -match 'Text message|Phone call' })
+$legacy     = @($inScope | Where-Object { $_.'MFA Type' -eq 'Legacy' })
+$unknownGov = @($inScope | Where-Object { $_.'MFA Type' -like 'Unknown*' })
+$unverified = @($inScope | Where-Object { $_.'Has Non-Phone Backup' -like 'Unknown*' })
+$onPhone    = @($inScope | Where-Object { $_.'Currently Signs In With' -match 'Text message|Phone call' })
 
 Write-Host "`n===== SUMMARY =====" -ForegroundColor Green
-Write-Host ("  Users with a phone number registered      : {0}" -f $Report.Count)
+if ($AllUsers) {
+    Write-Host ("  Users in the CSV (all users)              : {0}" -f $Report.Count)
+    Write-Host ("    ...of which use SMS or voice            : {0}" -f $inScope.Count) -ForegroundColor Yellow
+} else {
+    Write-Host ("  Users with a phone number registered      : {0}" -f $inScope.Count)
+}
 Write-Host ("  No durable non-phone backup               : {0}" -f $noBackup.Count) -ForegroundColor Red
 Write-Host ("    ...of which are administrators          : {0}" -f $admins.Count)   -ForegroundColor Red
 Write-Host ("  On LEGACY per-user MFA                    : {0}" -f $legacy.Count)   -ForegroundColor Yellow
@@ -587,6 +643,10 @@ if ($script:UnclassifiedUsers.Count -gt 0) {
 Write-Host "`n  The $($noBackup.Count) users with no durable backup face a blocking" -ForegroundColor Red
 Write-Host "  passkey registration prompt after 1 Feb 2027. No opt-out exists." -ForegroundColor Red
 
+if ($AllUsers) {
+    Write-Host "`n  Filter the CSV on 'Uses SMS or Voice' = Yes to get the standard report." -ForegroundColor DarkGray
+}
+
 if ($Report.Count -gt 0) {
     $stale = ($Report | Select-Object -First 1).'Data As Of'
     Write-Host "`n  Source report last refreshed: $stale" -ForegroundColor DarkGray
@@ -597,7 +657,10 @@ if ($Report.Count -gt 0) {
 # Export
 # ---------------------------------------------------------------------------
 $date = Get-Date -Format "yyyy-MM-dd"
-$file = Join-Path $OutputPath "SMS-Voice-MFA-Users-$date.csv"
+# Distinct filename: a full-tenant posture dump must never be mistaken for the
+# narrow SMS/voice report when someone finds it in output/ later.
+$name = if ($AllUsers) { "AllUsers-MFA-Posture-$date.csv" } else { "SMS-Voice-MFA-Users-$date.csv" }
+$file = Join-Path $OutputPath $name
 # utf8BOM, not UTF8: in PowerShell 7 plain UTF8 writes no byte-order mark, and
 # Excel then decodes accented names as mojibake for exactly the non-technical
 # audience this file is written for. The BOM is harmless to every other consumer.
