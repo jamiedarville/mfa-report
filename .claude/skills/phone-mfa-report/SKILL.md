@@ -33,9 +33,10 @@ Do not ask about `-OutputPath`. It is `./output`.
 1. Confirm the module is present:
    `pwsh -c "Get-Module -ListAvailable Microsoft.Graph.Authentication"`
    If absent, tell the user the install command — do not install it silently.
-2. Check the signed-in account holds **Global Reader or Authentication Policy
-   Administrator**. Security Reader is not enough and fails only at stage 3, after
-   the run has already taken minutes.
+2. Check the signed-in account holds **Global Reader** — the only single role that
+   covers both the registration report and per-user MFA state. Authentication
+   Policy Administrator covers only stage 3 (stage 1 hard-fails under it);
+   Security/Reports Reader covers only stage 1 (MFA Type comes back Unknown).
 3. Tell the user a browser window will open, and that the run consumes tenant-wide
    Graph quota. Get a go-ahead before starting.
 4. Run `pwsh ./execution/latest-mfa-report.ps1 -OutputPath ./output`.
@@ -61,13 +62,14 @@ Written for a non-technical reader. Sort by `Priority` and work down.
 
 | Column | Means |
 | --- | --- |
-| `Priority` | `1 - Urgent` (phone-only admin) through `5 - Monitor`. |
+| `Priority` | `1 - Urgent`: at risk **and** an administrator. `2 - High`: no durable non-phone backup (includes temporary-pass-only and unrecognised-method rows). `3 - Medium`: signs in with SMS/voice by default but has a backup — regardless of Legacy/Modern. `4 - Low`: on legacy per-user MFA, non-phone default. `5 - Monitor`: phone is a spare. |
 | `MFA Type` | **Legacy** = still governed by the old per-user MFA surface. **Modern** = governed by the Authentication Methods Policy. |
 | `Phone Can Receive` | "Text message or phone call" if a mobile is registered; "Phone call only" for office/alternate numbers, which cannot receive SMS. |
 | `Currently Signs In With` | Their actual default method. The only field that reliably separates SMS from voice. |
-| `Has Non-Phone Backup` | "No" is the cohort that gets blocked after 1 Feb 2027. |
+| `Has Non-Phone Backup` | Four values: `Yes` / `No` / `Temporary pass only` (a TAP expires — not a real backup) / `Unknown - method not recognised` (verify with IT before trusting the row). "No" and "Temporary pass only" are the cohort that gets blocked after 1 Feb 2027. |
+| `Backup Methods` | Every registered non-phone method, labelled `(temporary)` or `(unrecognised)` where applicable — never blank when the backup answer is not "No". |
 | `After 1 Feb 2027` | Plain-English outcome for that user. |
-| `Action Needed` | What to tell them to do. |
+| `Action Needed` | What to tell them to do. Says "No action needed yet" only when the legacy state was actually confirmed. |
 | `Data As Of` | When Microsoft last refreshed the source report. |
 
 `MFA Type` describes **governance, not the method**. A user can be Modern and still
@@ -81,8 +83,13 @@ be entirely on SMS. If someone reads "Modern" as "safe", correct them.
 - **Someone asks where the disabled accounts are** — Microsoft excludes disabled and
   soft-deleted users from `userRegistrationDetails` at source. They cannot appear.
   There is no parameter for it; a separate `/users` pull is the only route.
-- **Server-side filter rejected** — the script falls back to a full tenant scan
-  automatically and warns. Result is identical, run is slower.
+- **Server-side filter rejected (HTTP 400)** — the script falls back to a full
+  tenant scan automatically and warns. Result is identical, run is slower. Any
+  other stage-1 failure (throttle exhaustion, missing consent, licensing) is NOT
+  a filter problem and now surfaces as itself — read the actual error.
+- **"lookups throttled - retrying (sweep N/4)"** — normal. Graph throttles `$batch`
+  sub-requests individually; the script re-batches them with backoff. Only users
+  still throttled after the final sweep count as failures.
 - **Run exceeds 15 minutes** — look for a per-user loop that bypassed the stage-1
   filter. This is a code regression, not slowness.
 - **Counts swing sharply run over run** — suspect a classification bug before
@@ -105,3 +112,12 @@ turned up in the unclassified warning.
   `userPreferredMethodForSecondaryAuthentication` and, when
   `isSystemPreferredAuthenticationMethodEnabled` is true,
   `systemPreferredAuthenticationMethods`.
+- The only single role covering all stages is Global Reader: APA cannot read
+  `userRegistrationDetails` (delegated roles for it are Reports Reader, Security
+  Reader, Security Administrator, Global Reader), and none of those except Global
+  Reader can read `/authentication/requirements`.
+- Graph throttles `$batch` sub-requests individually — a 429 arrives inside an
+  HTTP 200 envelope with its own `Retry-After`, and Microsoft's guidance is to
+  re-batch just the failed items. Envelope-level retry never sees these.
+- PS7 `Export-Csv -Encoding UTF8` writes no BOM; Excel then garbles accented
+  names. `utf8BOM` is required for anything a non-technical reader will open.

@@ -25,8 +25,10 @@
       User.Read.All      -> department / job title
       Policy.Read.All    -> per-user MFA state (/authentication/requirements)
 
-    Minimum Entra role: Global Reader or Authentication Policy Administrator.
-    Security Reader is NOT sufficient - it cannot read per-user MFA state.
+    Minimum Entra role: Global Reader - the only single role that covers every
+    stage. Authentication Policy Administrator can read per-user MFA state but NOT
+    the userRegistrationDetails report (stage 1 hard-fails under it); Security
+    Reader / Reports Reader can read the report but not per-user MFA state.
 
     Requires Microsoft Entra ID P1 or above.
 #>
@@ -78,9 +80,14 @@ $PhoneMethodFriendly = @{
     'alternateMobilePhone' = 'Phone call only'
 }
 
-# Non-phone methods that satisfy MFA. Pattern-matched so a newly introduced name
-# containing a known stem still classifies rather than falling through.
-$StrongPattern = '(?i)(fido|passkey|windowshello|authenticator|onetimepasscode|oath|certificate|temporaryaccesspass|secureenclave|platformcredential)'
+# DURABLE non-phone methods that satisfy MFA. Pattern-matched so a newly introduced
+# name containing a known stem still classifies rather than falling through.
+$StrongPattern = '(?i)(fido|passkey|windowshello|authenticator|onetimepasscode|oath|certificate|secureenclave|platformcredential)'
+
+# Time-limited credentials. A Temporary Access Pass satisfies MFA today but expires
+# within hours to days - it must never count as the method a user still holds in
+# Feb 2027, and TAPs are typically issued to exactly the users with nothing else.
+$TempPattern = '(?i)temporaryaccesspass'
 
 # Registered, but not a second factor on their own.
 $NotSecondFactorPattern = '(?i)(^password$|^email$|securityquestion|apppassword)'
@@ -101,10 +108,11 @@ $PhonePreferred = @('sms','voiceMobile','voiceAlternateMobile','voiceOffice')
 function Split-Methods {
     param([string[]] $Methods)
 
-    $phone = @(); $strong = @(); $other = @(); $unknown = @()
+    $phone = @(); $strong = @(); $temp = @(); $other = @(); $unknown = @()
 
     foreach ($m in $Methods) {
         if     ($PhoneMethodFriendly.ContainsKey($m))  { $phone   += $m }
+        elseif ($m -match $TempPattern)                { $temp    += $m }
         elseif ($m -match $StrongPattern)              { $strong  += $m }
         elseif ($m -match $NotSecondFactorPattern)     { $other   += $m }
         else                                           { $unknown += $m }
@@ -113,6 +121,7 @@ function Split-Methods {
     [PSCustomObject]@{
         Phone           = $phone
         NonPhoneMfa     = $strong
+        Temporary       = $temp
         NotSecondFactor = $other
         Unclassified    = $unknown
     }
@@ -249,9 +258,13 @@ try {
                               -Activity 'Registration details (filtered)'
 }
 catch {
-    # $filter on this report endpoint is not universally available. Fall back to a
-    # full pull rather than returning nothing - slower, same result.
-    Write-Warning "Server-side filter rejected ($($_.Exception.Message.Trim())). Falling back to a full scan."
+    # Only a 400 means the filter itself was rejected. Anything else - throttle
+    # exhaustion, missing consent, licensing - must surface as itself: falling
+    # back would re-pull the whole tenant against a service that is already
+    # failing, and mislabel the real cause.
+    $status = Get-GraphStatusCode -ErrorRecord $_
+    if ($status -ne 400) { throw }
+    Write-Warning "Server-side filter rejected (HTTP 400). Falling back to a full scan - slower, same result."
     $regData = Get-GraphPaged -Uri $regBase -Activity 'Registration details (full scan)' |
                Where-Object { @($_.methodsRegistered | Where-Object { $PhoneMethodFriendly.ContainsKey($_) }).Count -gt 0 }
 }
@@ -260,6 +273,12 @@ $regData = @($regData)
 Write-Host "      $($regData.Count) users have a phone number registered." -ForegroundColor Yellow
 
 if ($regData.Count -eq 0) {
+    # A consent problem plus an empty result is a FAILED run, not an empty tenant -
+    # the bare exit 0 here previously masked an already-logged failure.
+    if ($script:FailureCount -gt 0) {
+        Write-Warning "No users found, but $($script:FailureCount) problem(s) occurred. Treat this run as FAILED, not as an empty tenant."
+        exit 1
+    }
     Write-Host "Nothing to report." -ForegroundColor Green
     exit 0
 }
@@ -299,56 +318,96 @@ else {
 
     $ids       = @($regData | ForEach-Object { $_.id })   # force an array: .Prop on a
     $batchSize = 20                                        # 1-element list returns a scalar
-    $done      = 0
 
-    for ($i = 0; $i -lt $ids.Count; $i += $batchSize) {
+    # Graph throttles $batch items INDIVIDUALLY: the envelope returns HTTP 200
+    # while a sub-response carries its own 429 + Retry-After, so the envelope-level
+    # retry never sees it. Per Microsoft's guidance, throttled sub-requests are
+    # re-issued in a fresh batch after the longest Retry-After. Bounded sweeps:
+    # users still throttled after the last sweep are counted as failures.
+    $pending   = $ids
+    $maxSweeps = 4
 
-        $chunk = @($ids[$i..([math]::Min($i + $batchSize - 1, $ids.Count - 1))])
+    for ($sweep = 1; ($sweep -le $maxSweeps) -and ($pending.Count -gt 0); $sweep++) {
 
-        $requests = @()
-        $n = 0
-        foreach ($id in $chunk) {
-            $n++
-            $requests += @{
-                id     = "$n"
-                method = "GET"
-                url    = "/users/$id/authentication/requirements"
+        $retryIds      = [System.Collections.Generic.List[string]]::new()
+        $maxRetryAfter = 0
+        $done          = 0
+
+        for ($i = 0; $i -lt $pending.Count; $i += $batchSize) {
+
+            $chunk = @($pending[$i..([math]::Min($i + $batchSize - 1, $pending.Count - 1))])
+
+            $requests = @()
+            $n = 0
+            foreach ($id in $chunk) {
+                $n++
+                $requests += @{
+                    id     = "$n"
+                    method = "GET"
+                    url    = "/users/$id/authentication/requirements"
+                }
             }
-        }
 
-        try {
-            $resp = Invoke-GraphWithRetry `
-                        -Uri    "https://graph.microsoft.com/beta/`$batch" `
-                        -Method "POST" `
-                        -Body   @{ requests = $requests }
-        }
-        catch {
-            Write-Warning "Batch starting at index $i failed: $($_.Exception.Message.Trim())"
-            $script:FailureCount++
-            continue
-        }
-
-        foreach ($r in $resp.responses) {
-            $idx = [int]$r.id - 1
-            $uid = $chunk[$idx]
-
-            if ($r.status -eq 200) {
-                $legacyState[$uid] = $r.body.perUserMfaState
+            try {
+                $resp = Invoke-GraphWithRetry `
+                            -Uri    "https://graph.microsoft.com/beta/`$batch" `
+                            -Method "POST" `
+                            -Body   @{ requests = $requests }
             }
-            else {
-                # Every non-200 is partial data, not just 403. A 429 inside a batch
-                # returns HTTP 200 on the envelope and would otherwise pass silently.
-                $legacyState[$uid] = if ($r.status -eq 403) { "AccessDenied" } else { "Error:$($r.status)" }
+            catch {
+                Write-Warning "Batch starting at index $i failed: $($_.Exception.Message.Trim())"
                 $script:FailureCount++
+                continue
             }
-        }
 
-        $done += $chunk.Count
-        Write-Progress -Activity "Legacy per-user MFA state" `
-                       -Status "$done / $($ids.Count)" `
-                       -PercentComplete (($done / $ids.Count) * 100) -Id 2
+            foreach ($r in $resp.responses) {
+                $idx = [int]$r.id - 1
+                $uid = $chunk[$idx]
+
+                if ($r.status -eq 200) {
+                    $legacyState[$uid] = $r.body.perUserMfaState
+                }
+                elseif ($r.status -eq 429 -or $r.status -ge 500) {
+                    # Transient - queue for the next sweep, don't fail the user yet.
+                    $retryIds.Add($uid)
+                    $ra = 0
+                    try { $ra = [int] $r.headers.'Retry-After' } catch { }
+                    if ($ra -gt $maxRetryAfter) { $maxRetryAfter = $ra }
+                }
+                elseif ($r.status -eq 403) {
+                    $legacyState[$uid] = "AccessDenied"
+                    $script:FailureCount++
+                }
+                else {
+                    $legacyState[$uid] = "Error:$($r.status)"
+                    $script:FailureCount++
+                }
+            }
+
+            $done += $chunk.Count
+            Write-Progress -Activity "Legacy per-user MFA state (sweep $sweep)" `
+                           -Status "$done / $($pending.Count)" `
+                           -PercentComplete (($done / $pending.Count) * 100) -Id 2
+        }
+        Write-Progress -Activity "Legacy per-user MFA state (sweep $sweep)" -Id 2 -Completed
+
+        $pending = @($retryIds)
+        if (($pending.Count -gt 0) -and ($sweep -lt $maxSweeps)) {
+            $wait = if ($maxRetryAfter -gt 0) { [math]::Min($maxRetryAfter, 120) }
+                    else                      { [int] [math]::Min([math]::Pow(2, $sweep + 1), 60) }
+            Write-Host "      $($pending.Count) lookups throttled - waiting ${wait}s, then retrying (sweep $sweep/$maxSweeps)." -ForegroundColor DarkYellow
+            Start-Sleep -Seconds $wait
+        }
     }
-    Write-Progress -Activity "Legacy per-user MFA state" -Id 2 -Completed
+
+    # Anything still pending exhausted its retries - THAT is a failure.
+    if ($pending.Count -gt 0) {
+        foreach ($uid in $pending) {
+            $legacyState[$uid] = "Error:throttled"
+            $script:FailureCount++
+        }
+        Write-Warning "$($pending.Count) legacy state lookups were still throttled after $maxSweeps sweeps."
+    }
 
     $denied = @($legacyState.Values | Where-Object { $_ -eq 'AccessDenied' }).Count
     if ($denied -gt 0) {
@@ -385,6 +444,7 @@ $Report = foreach ($r in $regData) {
              else                                     { "NotRetrieved" }
 
     $legacyEnabled = $state -in @('enabled','enforced')
+    $stateKnown    = $state -in @('enabled','enforced','disabled')
 
     # The requested column. "Legacy" means the account is still governed by the old
     # per-user MFA surface; "Modern" means it is governed by the Authentication
@@ -398,9 +458,29 @@ $Report = foreach ($r in $regData) {
         default        { 'Unknown - lookup failed' }
     }
 
-    # Phone-only means blocked at sign-in after 1 Feb 2027. Unclassified methods count
-    # as a possible fallback so nobody is wrongly marked safe or wrongly marked doomed.
-    $phoneOnly = ($split.NonPhoneMfa.Count -eq 0 -and $split.Unclassified.Count -eq 0)
+    # Backup classification, honestly. A Temporary Access Pass expires within hours
+    # to days, so it never counts as the method a user still holds in Feb 2027. An
+    # unrecognised method name is never assumed safe OR doomed - it becomes an
+    # explicit Unknown the reader is told to verify, not a quiet "Yes".
+    $hasDurableBackup = $split.NonPhoneMfa.Count -gt 0
+    $unverifiedOnly   = (-not $hasDurableBackup) -and ($split.Unclassified.Count -gt 0)
+    $tempOnly         = (-not $hasDurableBackup) -and (-not $unverifiedOnly) -and ($split.Temporary.Count -gt 0)
+    $blockedOutright  = (-not $hasDurableBackup) -and (-not $unverifiedOnly)   # includes tempOnly
+    $atRisk           = -not $hasDurableBackup
+
+    $backupAnswer =
+        if     ($hasDurableBackup) { 'Yes' }
+        elseif ($unverifiedOnly)   { 'Unknown - method not recognised' }
+        elseif ($tempOnly)         { 'Temporary pass only' }
+        else                       { 'No' }
+
+    # Never pair a non-"No" answer with a blank list - every registered non-phone
+    # method appears here, labelled for what it is.
+    $backupList = @(
+        $split.NonPhoneMfa
+        $split.Temporary    | ForEach-Object { "$_ (temporary)" }
+        $split.Unclassified | ForEach-Object { "$_ (unrecognised)" }
+    ) -join '; '
 
     # Only a mobile number can receive an SMS. Office and alternate-mobile numbers
     # are voice-call only, so a user holding just those is not an "SMS user" at all.
@@ -411,22 +491,31 @@ $Report = foreach ($r in $regData) {
         $script:UnclassifiedUsers += "$($r.userPrincipalName): $($split.Unclassified -join ', ')"
     }
 
+    # Priority ranks actual phone dependence above governance housekeeping: a
+    # Modern user who signs in with SMS every day outranks a Legacy user already
+    # on the Authenticator app.
     $priority =
-        if     ($phoneOnly -and $r.isAdmin)        { '1 - Urgent' }
-        elseif ($phoneOnly)                        { '2 - High' }
-        elseif ($legacyEnabled -and $defaultIsPhone) { '3 - Medium' }
-        elseif ($legacyEnabled)                    { '4 - Low' }
-        else                                       { '5 - Monitor' }
+        if     ($atRisk -and $r.isAdmin) { '1 - Urgent' }
+        elseif ($atRisk)                 { '2 - High' }
+        elseif ($defaultIsPhone)         { '3 - Medium' }
+        elseif ($legacyEnabled)          { '4 - Low' }
+        else                             { '5 - Monitor' }
 
     $action =
-        if     ($phoneOnly -and $r.isAdmin) { 'Urgent: administrator with no backup method. Set up a passkey or security key now.' }
-        elseif ($phoneOnly)                 { 'Set up Microsoft Authenticator or a passkey before 1 Feb 2027.' }
-        elseif ($legacyEnabled)             { 'Move off legacy per-user MFA. A backup method is already in place.' }
-        else                                { 'No action needed yet. Already has a non-phone method.' }
+        if     ($unverifiedOnly)                  { 'Check with IT: a registered method could not be classified by this report. Treat as having no backup until verified.' }
+        elseif ($tempOnly)                        { 'Their only backup is a Temporary Access Pass, which expires. Set up Microsoft Authenticator or a passkey now.' }
+        elseif ($blockedOutright -and $r.isAdmin) { 'Urgent: administrator with no backup method. Set up a passkey or security key now.' }
+        elseif ($blockedOutright)                 { 'Set up Microsoft Authenticator or a passkey before 1 Feb 2027.' }
+        elseif ($defaultIsPhone)                  { 'Signs in with SMS or a phone call today. Switch their default to the Authenticator app or a passkey.' }
+        elseif ($legacyEnabled)                   { 'Move off legacy per-user MFA. A backup method is already in place.' }
+        elseif ($stateKnown)                      { 'No action needed yet. Already has a non-phone method.' }
+        else                                      { 'Has a non-phone backup, but legacy MFA status was not checked. Re-run the full report before closing this row out.' }
 
     $outcome =
-        if ($phoneOnly) { 'BLOCKED - forced to set up a passkey before they can sign in' }
-        else            { 'Can still sign in using their other method' }
+        if     ($hasDurableBackup) { 'Can still sign in using their other method' }
+        elseif ($unverifiedOnly)   { 'Unknown - depends on a method this report could not classify' }
+        elseif ($tempOnly)         { 'BLOCKED once the temporary pass expires - forced to set up a passkey' }
+        else                       { 'BLOCKED - forced to set up a passkey before they can sign in' }
 
     $row = [ordered]@{
         'Priority'                = $priority
@@ -439,8 +528,8 @@ $Report = foreach ($r in $regData) {
         'MFA Type'                = $mfaType
         'Phone Can Receive'       = $phoneCapability
         'Currently Signs In With' = $preferred
-        'Has Non-Phone Backup'    = if ($phoneOnly) { 'No' } else { 'Yes' }
-        'Backup Methods'          = ($split.NonPhoneMfa -join '; ')
+        'Has Non-Phone Backup'    = $backupAnswer
+        'Backup Methods'          = $backupList
         'After 1 Feb 2027'        = $outcome
         'Action Needed'           = $action
         'Data As Of'              = $r.lastUpdatedDateTime
@@ -455,6 +544,8 @@ $Report = foreach ($r in $regData) {
         $row['_SystemPreferredOn']     = $r.isSystemPreferredAuthenticationMethodEnabled
         $row['_IsMfaRegistered']       = $r.isMfaRegistered
         $row['_IsMfaCapable']          = $r.isMfaCapable
+        # Registered but not capable = the registered method is NOT allowed by the
+        # Authentication Methods Policy. Worth investigating separately.
         $row['_RegisteredNotCapable']  = ($r.isMfaRegistered -eq $true -and $r.isMfaCapable -eq $false)
     }
 
@@ -466,21 +557,25 @@ $Report = $Report | Sort-Object Priority, 'Name'
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-$blocked = @($Report | Where-Object { $_.'Has Non-Phone Backup' -eq 'No' })
-$admins  = @($blocked | Where-Object { $_.Administrator -eq 'Yes' })
-$legacy  = @($Report | Where-Object { $_.'MFA Type' -eq 'Legacy' })
-$unknown = @($Report | Where-Object { $_.'MFA Type' -like 'Unknown*' })
-$onPhone = @($Report | Where-Object { $_.'Currently Signs In With' -match 'Text message|Phone call' })
+$noBackup   = @($Report | Where-Object { $_.'Has Non-Phone Backup' -in @('No','Temporary pass only') })
+$admins     = @($noBackup | Where-Object { $_.Administrator -eq 'Yes' })
+$legacy     = @($Report | Where-Object { $_.'MFA Type' -eq 'Legacy' })
+$unknownGov = @($Report | Where-Object { $_.'MFA Type' -like 'Unknown*' })
+$unverified = @($Report | Where-Object { $_.'Has Non-Phone Backup' -like 'Unknown*' })
+$onPhone    = @($Report | Where-Object { $_.'Currently Signs In With' -match 'Text message|Phone call' })
 
 Write-Host "`n===== SUMMARY =====" -ForegroundColor Green
 Write-Host ("  Users with a phone number registered      : {0}" -f $Report.Count)
-Write-Host ("  Phone is their ONLY method                : {0}" -f $blocked.Count) -ForegroundColor Red
-Write-Host ("    ...of which are administrators          : {0}" -f $admins.Count)  -ForegroundColor Red
-Write-Host ("  On LEGACY per-user MFA                    : {0}" -f $legacy.Count)  -ForegroundColor Yellow
+Write-Host ("  No durable non-phone backup               : {0}" -f $noBackup.Count) -ForegroundColor Red
+Write-Host ("    ...of which are administrators          : {0}" -f $admins.Count)   -ForegroundColor Red
+Write-Host ("  On LEGACY per-user MFA                    : {0}" -f $legacy.Count)   -ForegroundColor Yellow
 Write-Host ("  Sign in with SMS/voice by default         : {0}" -f $onPhone.Count)
 
-if ($unknown.Count -gt 0) {
-    Write-Host ("  MFA Type could not be determined          : {0}" -f $unknown.Count) -ForegroundColor DarkYellow
+if ($unverified.Count -gt 0) {
+    Write-Host ("  Backup could not be verified              : {0}" -f $unverified.Count) -ForegroundColor DarkYellow
+}
+if ($unknownGov.Count -gt 0) {
+    Write-Host ("  MFA Type could not be determined          : {0}" -f $unknownGov.Count) -ForegroundColor DarkYellow
 }
 
 if ($script:UnclassifiedUsers.Count -gt 0) {
@@ -489,7 +584,7 @@ if ($script:UnclassifiedUsers.Count -gt 0) {
     $script:FailureCount++
 }
 
-Write-Host "`n  The $($blocked.Count) users with no backup method face a blocking" -ForegroundColor Red
+Write-Host "`n  The $($noBackup.Count) users with no durable backup face a blocking" -ForegroundColor Red
 Write-Host "  passkey registration prompt after 1 Feb 2027. No opt-out exists." -ForegroundColor Red
 
 if ($Report.Count -gt 0) {
@@ -503,7 +598,10 @@ if ($Report.Count -gt 0) {
 # ---------------------------------------------------------------------------
 $date = Get-Date -Format "yyyy-MM-dd"
 $file = Join-Path $OutputPath "SMS-Voice-MFA-Users-$date.csv"
-$Report | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+# utf8BOM, not UTF8: in PowerShell 7 plain UTF8 writes no byte-order mark, and
+# Excel then decodes accented names as mojibake for exactly the non-technical
+# audience this file is written for. The BOM is harmless to every other consumer.
+$Report | Export-Csv -Path $file -NoTypeInformation -Encoding utf8BOM
 Write-Host "`nReport saved to: $file" -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
@@ -544,8 +642,9 @@ KNOWN LIMITATIONS
 4. perUserMfaState IS BETA-ONLY.
    /beta/users/{id}/authentication/requirements has no v1.0 equivalent and is
    subject to change. There is no bulk endpoint - $batch at 20/request is the
-   fastest supported approach. It runs only against users who already have a phone
-   method, which is what keeps this tractable at scale.
+   fastest supported approach. Sub-request throttling (429 inside a 200 envelope)
+   is retried in bounded sweeps honouring Retry-After; users still throttled after
+   the final sweep are counted as failures, never silently dropped.
 
 5. SMS vs VOICE IS INFERRED, NOT STATED.
    methodsRegistered records that a phone NUMBER exists, not which channel is
@@ -559,10 +658,15 @@ KNOWN LIMITATIONS
    (perUserMfaState enabled or enforced). Modern = perUserMfaState disabled, so the
    Authentication Methods Policy governs. A user can be Modern and still be on SMS.
 
-7. REPORT DATA LAG.
+7. A TEMPORARY ACCESS PASS IS NOT A BACKUP.
+   TAPs expire within hours to days and are typically issued to users who have
+   nothing else. A user whose only non-phone method is a TAP is treated as having
+   no durable backup for the Feb 2027 projection.
+
+8. REPORT DATA LAG.
    userRegistrationDetails refreshes roughly every 36 hours. Check "Data As Of"
    before treating any row as current.
 
-8. LICENSING.
+9. LICENSING.
    The authentication methods activity report requires Entra ID P1 or above.
 #>

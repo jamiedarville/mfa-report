@@ -17,8 +17,9 @@ Microsoft's retirement of SMS and voice MFA.
 | 30 Oct 2026 | Customer-managed telecom providers become selectable in the Microsoft Security Store. |
 | 1 Feb 2027 | Microsoft-provided SMS/Voice delivery retires. Users whose only method is phone get a **blocking** passkey registration prompt. No opt-out. |
 
-The cohort that matters most is *phone-only* users — `PhoneOnly = true` in the report.
-They are the ones who get blocked, and admins among them are the priority within that.
+The cohort that matters most is users with no durable non-phone backup — `Has
+Non-Phone Backup` = `No` or `Temporary pass only` in the report. They are the ones
+who get blocked, and admins among them are the priority within that.
 
 ## Non-negotiables
 
@@ -71,10 +72,11 @@ cat execution/README.md
 
 Graph scopes: `AuditLog.Read.All`, `User.Read.All`, `Policy.Read.All`.
 
-Minimum Entra role: **Global Reader or Authentication Policy Administrator**.
-Security Reader is *not* sufficient — it cannot read per-user MFA state, and a run
-under it silently produces "Unknown" in the MFA Type column for every row. Requires
-Entra ID P1 or above for the authentication methods activity report.
+Minimum Entra role: **Global Reader** — the only single role that satisfies every
+stage. Authentication Policy Administrator cannot read the registration report, so
+stage 1 hard-fails under it; Security Reader cannot read per-user MFA state, so MFA
+Type comes back "Unknown" for every row. Requires Entra ID P1 or above for the
+authentication methods activity report.
 
 `Policy.Read.All` is the scope that grants `/authentication/requirements`.
 `UserAuthenticationMethod.Read.All` does **not** — it covers `signInPreferences`
