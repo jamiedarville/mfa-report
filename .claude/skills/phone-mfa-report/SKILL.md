@@ -19,14 +19,20 @@ listing every user who can still authenticate with a phone.
 - **`-IncludeTechnicalColumns`** — off by default. Adds raw Graph values prefixed
   with `_` for troubleshooting. Do not add these to a report meant for a
   non-technical audience.
+- **`-AllUsers`** — off by default. Emits every user instead of only phone holders,
+  so the CSV can be filtered in Excel on the `Uses SMS or Voice` column. Produces a
+  **full-tenant MFA posture dump** — a broader payload than the default report, so
+  get an explicit go-ahead before running it, and expect a materially longer run.
+  Stage 3 stays narrowed to phone holders in this mode.
 
 Do not ask about `-OutputPath`. It is `./output`.
 
 ## Tools
 
-- `execution/latest-mfa-report.ps1` — three stages: registration details filtered
-  server-side to phone holders, a department/job-title lookup, then batched per-user
-  MFA state.
+- `execution/latest-mfa-report.ps1` — three stages: registration details (filtered
+  server-side to phone holders unless `-AllUsers`), a department/job-title lookup,
+  then batched per-user MFA state. Stage 3 is always narrowed to phone holders,
+  in both modes — that narrowing is what keeps the run in minutes.
 
 ## Steps
 
@@ -51,9 +57,11 @@ Do not ask about `-OutputPath`. It is `./output`.
 
 ## Outputs
 
-- `output/SMS-Voice-MFA-Users-<yyyy-MM-dd>.csv`
+- `output/SMS-Voice-MFA-Users-<yyyy-MM-dd>.csv` — default mode.
+- `output/AllUsers-MFA-Posture-<yyyy-MM-dd>.csv` — `-AllUsers` mode. Distinct name
+  so a full-tenant dump is never mistaken for the narrow report.
 
-Sensitive. Hand over the path, not the contents. Never paste rows, names, or the
+Both sensitive; the `-AllUsers` one more so. Hand over the path, not the contents. Never paste rows, names, or the
 admin subset into chat, a Sheet, mail, or a channel — see Deliverables in CLAUDE.md.
 
 ## The columns
@@ -66,7 +74,8 @@ Written for a non-technical reader. Sort by `Priority` and work down.
 | `MFA Type` | **Legacy** = still governed by the old per-user MFA surface. **Modern** = governed by the Authentication Methods Policy. |
 | `Phone Can Receive` | "Text message or phone call" if a mobile is registered; "Phone call only" for office/alternate numbers, which cannot receive SMS. |
 | `Currently Signs In With` | Their actual default method. The only field that reliably separates SMS from voice. |
-| `Has Non-Phone Backup` | Four values: `Yes` / `No` / `Temporary pass only` (a TAP expires — not a real backup) / `Unknown - method not recognised` (verify with IT before trusting the row). "No" and "Temporary pass only" are the cohort that gets blocked after 1 Feb 2027. |
+| `Uses SMS or Voice` | `-AllUsers` only matters here: `Yes` / `No` / `Unknown - method not recognised`. Filter on `Yes` **plus** `Unknown` — an unrecognised method cannot be ruled out as a phone method. |
+| `Has Non-Phone Backup` | `Yes` / `No` / `Temporary pass only` (a TAP expires — not a real backup) / `Unknown - method not recognised` (verify with IT before trusting the row). On out-of-scope rows: `No - no MFA method at all` or `n/a - temporary pass, no phone method`. Only the bare `No` and `Temporary pass only` are the blocked cohort. |
 | `Backup Methods` | Every registered non-phone method, labelled `(temporary)` or `(unrecognised)` where applicable — never blank when the backup answer is not "No". |
 | `After 1 Feb 2027` | Plain-English outcome for that user. |
 | `Action Needed` | What to tell them to do. Says "No action needed yet" only when the legacy state was actually confirmed. |
@@ -90,8 +99,11 @@ be entirely on SMS. If someone reads "Modern" as "safe", correct them.
 - **"lookups throttled - retrying (sweep N/4)"** — normal. Graph throttles `$batch`
   sub-requests individually; the script re-batches them with backoff. Only users
   still throttled after the final sweep count as failures.
-- **Run exceeds 15 minutes** — look for a per-user loop that bypassed the stage-1
-  filter. This is a code regression, not slowness.
+- **Run exceeds 15 minutes** — in the **default** mode, look for a per-user loop
+  that bypassed the stage-1 filter; that is a code regression, not slowness. Under
+  `-AllUsers` the stage-1 filter is dropped deliberately, so a longer run is
+  expected and the per-user-loop diagnostic does not apply — check that stage 3
+  still iterates phone holders before concluding anything.
 - **Counts swing sharply run over run** — suspect a classification bug before
   believing the tenant changed that much.
 - **User asks for AMP scope** — this script does not evaluate Authentication Methods

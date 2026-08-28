@@ -4,7 +4,9 @@
     a non-technical reader can act on.
 
 .DESCRIPTION
-    Read-only. One row per user who has a phone number registered as an MFA method.
+    Read-only. By default, one row per user who has a phone number registered as an
+    MFA method. With -AllUsers, one row per user in the registration report, with a
+    "Uses SMS or Voice" column to filter on downstream.
 
     Answers, in plain language:
       - Who is still on SMS / voice?
@@ -68,8 +70,10 @@ $script:FailureCount = 0
 
 # Method names Graph returned that this script does not recognise. Never silently
 # ignored - an unknown name could be a second factor, which would wrongly mark
-# someone as having no backup method.
-$script:UnclassifiedUsers = @()
+# someone as having no backup method. A List, not an array: under -AllUsers this
+# can accumulate across the whole directory, and `+=` on an array reallocates and
+# copies on every append.
+$script:UnclassifiedUsers = [System.Collections.Generic.List[string]]::new()
 
 # ---------------------------------------------------------------------------
 # Method vocabulary
@@ -470,9 +474,17 @@ $Report = foreach ($r in $regData) {
     # Does this user have any phone method at all? Under -AllUsers most rows will
     # not, and every retirement-related column below has to say so rather than
     # implying the SMS/voice deadline applies to them.
-    $hasPhone = $split.Phone.Count -gt 0
+    #
+    # Three states, not two. An unrecognised method name is NOT proof of absence -
+    # it could BE a phone method under a name this script does not know yet.
+    # Collapsing it into "no phone" is exactly the benign-default fall-through the
+    # script contract forbids, and under -AllUsers it would put a confident
+    # "Not affected" in the deliverable for a user who may be squarely in scope.
+    $hasPhone     = $split.Phone.Count -gt 0
+    $phoneUnknown = (-not $hasPhone) -and ($split.Unclassified.Count -gt 0)
 
-    $state = if (-not $hasPhone)                      { "NoPhoneMethod" }
+    $state = if ($phoneUnknown)                       { "UnknownMethod" }
+             elseif (-not $hasPhone)                  { "NoPhoneMethod" }
              elseif ($SkipLegacyStateLookup)          { "NotChecked" }
              elseif ($legacyState.ContainsKey($r.id)) { $legacyState[$r.id] }
              else                                     { "NotRetrieved" }
@@ -488,6 +500,7 @@ $Report = foreach ($r in $regData) {
         'enforced'      { 'Legacy' }
         'disabled'      { 'Modern' }
         'NoPhoneMethod' { 'Not checked - no phone method' }
+        'UnknownMethod' { 'Not checked - method not recognised' }
         'NotChecked'    { 'Unknown - not checked' }
         'AccessDenied'  { 'Unknown - permission denied' }
         default         { 'Unknown - lookup failed' }
@@ -505,12 +518,19 @@ $Report = foreach ($r in $regData) {
     # phone and no MFA at all is a real gap, but not THIS deadline's gap.
     $atRisk           = $hasPhone -and (-not $hasDurableBackup)
 
+    # CLAUDE.md and SKILL.md define 'No' and 'Temporary pass only' as the cohort
+    # blocked after 1 Feb 2027, and tell readers to filter this column on them.
+    # Out-of-scope rows must therefore never emit either string, or an -AllUsers
+    # CSV over-selects users the same row marks '6 - Not affected'.
     $backupAnswer =
-        if     ($hasDurableBackup) { 'Yes' }
-        elseif ($unverifiedOnly)   { 'Unknown - method not recognised' }
-        elseif ($tempOnly)         { 'Temporary pass only' }
-        elseif (-not $hasPhone)    { 'No - no MFA method at all' }
-        else                       { 'No' }
+        if     ($hasDurableBackup)              { 'Yes' }
+        elseif ($phoneUnknown)                  { 'Unknown - method not recognised' }
+        elseif (-not $hasPhone)                 {
+                   if ($split.Temporary.Count -gt 0) { 'n/a - temporary pass, no phone method' }
+                   else                              { 'No - no MFA method at all' } }
+        elseif ($unverifiedOnly)                { 'Unknown - method not recognised' }
+        elseif ($tempOnly)                      { 'Temporary pass only' }
+        else                                    { 'No' }
 
     # Never pair a non-"No" answer with a blank list - every registered non-phone
     # method appears here, labelled for what it is.
@@ -522,27 +542,33 @@ $Report = foreach ($r in $regData) {
 
     # Only a mobile number can receive an SMS. Office and alternate-mobile numbers
     # are voice-call only, so a user holding just those is not an "SMS user" at all.
-    $phoneCapability = if     (-not $hasPhone)                       { 'No phone registered' }
+    $phoneCapability = if     ($phoneUnknown)                        { 'Unknown - method not recognised' }
+                       elseif (-not $hasPhone)                       { 'No phone registered' }
                        elseif ($split.Phone -contains 'mobilePhone') { 'Text message or phone call' }
                        else                                          { 'Phone call only' }
 
     if ($split.Unclassified.Count -gt 0) {
-        $script:UnclassifiedUsers += "$($r.userPrincipalName): $($split.Unclassified -join ', ')"
+        $script:UnclassifiedUsers.Add("$($r.userPrincipalName): $($split.Unclassified -join ', ')")
     }
 
     # Priority ranks actual phone dependence above governance housekeeping: a
     # Modern user who signs in with SMS every day outranks a Legacy user already
     # on the Authenticator app.
+    # An unrecognised method is ranked as if it were a phone method, not as
+    # "not affected" - fail safe, because we cannot show that it isn't one.
     $priority =
-        if     (-not $hasPhone)          { '6 - Not affected' }
-        elseif ($atRisk -and $r.isAdmin) { '1 - Urgent' }
-        elseif ($atRisk)                 { '2 - High' }
-        elseif ($defaultIsPhone)         { '3 - Medium' }
-        elseif ($legacyEnabled)          { '4 - Low' }
-        else                             { '5 - Monitor' }
+        if     ($phoneUnknown -and $r.isAdmin) { '1 - Urgent' }
+        elseif ($phoneUnknown)                 { '2 - High' }
+        elseif (-not $hasPhone)                { '6 - Not affected' }
+        elseif ($atRisk -and $r.isAdmin)       { '1 - Urgent' }
+        elseif ($atRisk)                       { '2 - High' }
+        elseif ($defaultIsPhone)               { '3 - Medium' }
+        elseif ($legacyEnabled)                { '4 - Low' }
+        else                                   { '5 - Monitor' }
 
     $action =
-        if     (-not $hasPhone -and -not $hasDurableBackup -and -not $tempOnly -and -not $unverifiedOnly) {
+        if     ($phoneUnknown)                    { 'Check with IT: this report could not classify their registered method, so it cannot rule out SMS or voice. Verify before treating as out of scope.' }
+        elseif (-not $hasPhone -and -not $hasDurableBackup -and -not $tempOnly) {
                                                     'Not affected by the SMS/voice retirement, but has no MFA method registered at all. Worth a separate look.' }
         elseif (-not $hasPhone)                   { 'None - not affected by the SMS/voice retirement.' }
         elseif ($unverifiedOnly)                  { 'Check with IT: a registered method could not be classified by this report. Treat as having no backup until verified.' }
@@ -555,16 +581,19 @@ $Report = foreach ($r in $regData) {
         else                                      { 'Has a non-phone backup, but legacy MFA status was not checked. Re-run the full report before closing this row out.' }
 
     $outcome =
-        if     (-not $hasPhone)    { 'Not affected - no phone method registered' }
+        if     ($phoneUnknown)     { 'Unknown - depends on a method this report could not classify' }
+        elseif (-not $hasPhone)    { 'Not affected - no phone method registered' }
         elseif ($hasDurableBackup) { 'Can still sign in using their other method' }
         elseif ($unverifiedOnly)   { 'Unknown - depends on a method this report could not classify' }
         elseif ($tempOnly)         { 'BLOCKED once the temporary pass expires - forced to set up a passkey' }
         else                       { 'BLOCKED - forced to set up a passkey before they can sign in' }
 
     $row = [ordered]@{
-        # The filter column. In Excel: Data > Filter, then tick "Yes" here to get
-        # exactly the default (non--AllUsers) report back.
-        'Uses SMS or Voice'       = if ($hasPhone) { 'Yes' } else { 'No' }
+        # The filter column. In Excel: Data > Filter, then tick "Yes" (and
+        # "Unknown...", which may also be in scope) to get the default report back.
+        'Uses SMS or Voice'       = if     ($hasPhone)     { 'Yes' }
+                                    elseif ($phoneUnknown) { 'Unknown - method not recognised' }
+                                    else                   { 'No' }
         'Priority'                = $priority
         'Name'                    = $r.userDisplayName
         'Sign-in Name'            = $r.userPrincipalName
@@ -608,6 +637,7 @@ $Report = $Report | Sort-Object Priority, 'Name'
 # under -AllUsers those are different numbers and conflating them would overstate
 # or understate the exposure depending on which way you squint.
 $inScope    = @($Report | Where-Object { $_.'Uses SMS or Voice' -eq 'Yes' })
+$scopeUnkn  = @($Report | Where-Object { $_.'Uses SMS or Voice' -like 'Unknown*' })
 $noBackup   = @($inScope | Where-Object { $_.'Has Non-Phone Backup' -in @('No','Temporary pass only') })
 $admins     = @($noBackup | Where-Object { $_.Administrator -eq 'Yes' })
 $legacy     = @($inScope | Where-Object { $_.'MFA Type' -eq 'Legacy' })
@@ -627,6 +657,9 @@ Write-Host ("    ...of which are administrators          : {0}" -f $admins.Count
 Write-Host ("  On LEGACY per-user MFA                    : {0}" -f $legacy.Count)   -ForegroundColor Yellow
 Write-Host ("  Sign in with SMS/voice by default         : {0}" -f $onPhone.Count)
 
+if ($scopeUnkn.Count -gt 0) {
+    Write-Host ("  In scope UNKNOWN (method not recognised)  : {0}" -f $scopeUnkn.Count) -ForegroundColor DarkYellow
+}
 if ($unverified.Count -gt 0) {
     Write-Host ("  Backup could not be verified              : {0}" -f $unverified.Count) -ForegroundColor DarkYellow
 }
@@ -732,4 +765,14 @@ KNOWN LIMITATIONS
 
 9. LICENSING.
    The authentication methods activity report requires Entra ID P1 or above.
+
+10. UNDER -AllUsers, LEGACY STATE IS CHECKED ONLY FOR THE PHONE COHORT.
+    Stage 3 runs against phone holders only - deliberately, because a per-user
+    stage over the whole directory would be the forbidden 22,000-request loop.
+    Rows where "Uses SMS or Voice" is No therefore show "Not checked - no phone
+    method" in MFA Type; some of them may in fact be on legacy per-user MFA. The
+    "On LEGACY per-user MFA" summary count is scoped to the phone cohort in BOTH
+    modes. An -AllUsers CSV cannot be used to size the tenant-wide legacy MFA
+    population. -AllUsers also pulls the full directory in stage 1, so expect a
+    materially longer run than the default mode.
 #>

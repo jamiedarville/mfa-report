@@ -21,6 +21,10 @@ The cohort that matters most is users with no durable non-phone backup — `Has
 Non-Phone Backup` = `No` or `Temporary pass only` in the report. They are the ones
 who get blocked, and admins among them are the priority within that.
 
+On an `-AllUsers` CSV, filter `Uses SMS or Voice` = `Yes` **first** — that column
+also carries `Unknown - method not recognised`, which is in scope until someone
+verifies otherwise.
+
 ## Non-negotiables
 
 **These scripts are read-only.** No `PATCH`, no mutating `POST` (a `$batch` of `GET`s
@@ -65,6 +69,9 @@ pwsh ./execution/latest-mfa-report.ps1 -OutputPath ./output
 
 # Fast run — skips the per-user legacy-state stage, keeps phone-dependency analysis
 pwsh ./execution/latest-mfa-report.ps1 -OutputPath ./output -SkipLegacyStateLookup
+
+# Every user, to filter in Excel on "Uses SMS or Voice" — full-tenant posture dump
+pwsh ./execution/latest-mfa-report.ps1 -OutputPath ./output -AllUsers
 
 # See what every script does without reading them
 cat execution/README.md
