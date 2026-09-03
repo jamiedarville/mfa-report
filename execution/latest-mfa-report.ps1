@@ -24,7 +24,7 @@
 
     Graph scopes:
       AuditLog.Read.All  -> userRegistrationDetails report
-      User.Read.All      -> department / job title
+      User.Read.All      -> department / job title / employee type
       Policy.Read.All    -> per-user MFA state (/authentication/requirements)
 
     Minimum Entra role: Global Reader - the only single role that covers every
@@ -311,23 +311,23 @@ if ($regData.Count -eq 0) {
 }
 
 # ---------------------------------------------------------------------------
-# STAGE 2 - department / job title only
+# STAGE 2 - department / job title / employee type only
 # ---------------------------------------------------------------------------
 # userRegistrationDetails already carries userPrincipalName, userDisplayName and
 # userType, so this pull exists purely to attach org context for whoever has to
 # chase these people down.
-Write-Host "[2/3] Attaching department and job title..." -ForegroundColor Cyan
+Write-Host "[2/3] Attaching department, job title and employee type..." -ForegroundColor Cyan
 
 $userMap = @{}
 try {
-    $userUri  = "https://graph.microsoft.com/v1.0/users?`$select=id,department,jobTitle&`$top=999"
+    $userUri  = "https://graph.microsoft.com/v1.0/users?`$select=id,department,jobTitle,employeeType&`$top=999"
     $userData = Get-GraphPaged -Uri $userUri -Activity 'Directory accounts'
     foreach ($u in $userData) { $userMap[$u.id] = $u }
     Write-Host "      $($userData.Count) directory accounts." -ForegroundColor DarkGray
 }
 catch {
     Write-Warning "Could not read directory accounts: $($_.Exception.Message.Trim())"
-    Write-Warning "Department and Job Title will be blank."
+    Write-Warning "Department, Job Title and Employee Type will be blank."
     $script:FailureCount++
 }
 
@@ -599,6 +599,7 @@ $Report = foreach ($r in $regData) {
         'Sign-in Name'            = $r.userPrincipalName
         'Department'              = $acct.department
         'Job Title'               = $acct.jobTitle
+        'Employee Type'           = $acct.employeeType
         'Administrator'           = if ($r.isAdmin) { 'Yes' } else { 'No' }
         'Account Type'            = if ($r.userType -eq 'guest') { 'Guest' } else { 'Staff' }
         'MFA Type'                = $mfaType
@@ -775,4 +776,13 @@ KNOWN LIMITATIONS
     modes. An -AllUsers CSV cannot be used to size the tenant-wide legacy MFA
     population. -AllUsers also pulls the full directory in stage 1, so expect a
     materially longer run than the default mode.
+
+11. "EMPLOYEE TYPE" IS WHATEVER THE TENANT PUT THERE.
+    employeeType is a free-text directory attribute with no schema Microsoft
+    enforces - typically populated by HR sync or AD Connect, and blank on every
+    account in tenants that never set it. Values are not normalised ("Contractor",
+    "contractor" and "CONTR" are three different strings). It is reported verbatim
+    for triage and segmentation; do not filter or count on it without first
+    checking what values the tenant actually uses. Guests and service accounts
+    are especially likely to have it blank.
 #>
